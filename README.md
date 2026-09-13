@@ -61,6 +61,11 @@ lands you on a fresh empty one and the workspace you left behind is reaped if yo
 emptied it (`gloview:setworkspace` never creates; it only switches to a workspace that
 already exists on the monitor).
 
+Strip cards: clicking a card that has windows on it shows that workspace in the main
+area (the live desktop follows on close). Clicking an **empty** card — the trailing one
+`dynamic_workspaces` adds, or any listed empty workspace — switches to it and closes the
+overview: there is nothing on it to pick, so the click means "take me there".
+
 Lua:
 
 ```lua
@@ -144,7 +149,7 @@ All keys live under `plugin:gloview:*`. Colors are `0xAARRGGBB` integers.
 | `exit_on_switch` | bool (0/1) | `0` | Dismiss when the live workspace changes underneath (e.g. a keybind) |
 | `show_all_workspaces` | bool (0/1) | `0` | Main area shows every window on the monitor (expo), not just the displayed workspace. Toggle live with `gloview:allworkspaces`, the `key_all_workspaces` key, or the strip's "All" card. Picking a preview here follows it: the overview closes onto that window's workspace |
 | `show_empty` | bool (0/1) | `1` | Keep empty workspaces as strip cards. Has no effect while `dynamic_workspaces` is on (which it is by default) — set that to `0` to get the old always-list-everything strip back |
-| `dynamic_workspaces` | bool (0/1) | `1` | GNOME/hyprnome-style workspaces: only populated workspaces are listed and the strip ends in one empty card (drawn as a workspace, not a `+`). Stepping onto it or dropping a window into it creates it; the *next* empty card only appears once a window actually lands there, so you never see two blank desktops in a row, and emptying it again takes the extra card back away. Workspaces you empty drop off the strip. Forces `show_empty` off. Pair with `autodelete_empty` if you also want workspaces your config pins to be destroyed, not just hidden |
+| `dynamic_workspaces` | bool (0/1) | `1` | GNOME/hyprnome-style workspaces: only populated workspaces are listed and the strip ends in one empty card (drawn as a workspace, not a `+`). Stepping onto it, clicking it (which also closes the overview onto the new desktop) or dropping a window into it creates it; the *next* empty card only appears once a window actually lands there, so you never see two blank desktops in a row, and emptying it again takes the extra card back away. Workspaces you empty drop off the strip. Forces `show_empty` off. Pair with `autodelete_empty` if you also want workspaces your config pins to be destroyed, not just hidden |
 | `autodelete_empty` | bool (0/1) | `1` | Let Hyprland reap empty workspaces this monitor still pins. Hyprland already destroys unpinned empties on its own, so this only affects ones held by a `persistent:true` rule (and gloview's own abandoned trailing workspace) — the "empty ones get deleted automatically" half of GNOME-style workspaces. **Releasing a persistent workspace lasts until your next config reload — set this to `0` if you keep `persistent:true` workspaces you want left alone.** Skips the displayed workspace, anything visible on any monitor, workspaces holding any window (mapped or not), scratchpads, named workspaces, and other monitors' workspaces |
 | `show_workspace_labels` | bool (0/1) | `1` | Workspace names above the strip cards. Off frees the label band, so the cards grow into it |
 | `show_window_labels` | bool (0/1) | `1` | Window title pill under a hovered/selected preview |
@@ -152,7 +157,7 @@ All keys live under `plugin:gloview:*`. Colors are `0xAARRGGBB` integers.
 | `strip_all_card` | bool (0/1) | `0` | Show a leading "All workspaces" card on the strip that toggles the expo view |
 | `drag_to_swap` | bool (0/1) | `1` | Grid mode: dropping a preview onto another swaps the two windows' places |
 | `switch_on_drop` | bool (0/1) | `0` | Dropping a window on a card also follows it to that workspace |
-| `switch_on_new_workspace` | bool (0/1) | `1` | Clicking `+` follows the display to the new workspace |
+| `switch_on_new_workspace` | bool (0/1) | `1` | Clicking the plain `+` follows the display to the new workspace. (The trailing card `dynamic_workspaces` draws is a workspace card, not a `+`: clicking it always takes you there and closes the overview) |
 | `close_button_color` | color | `0xe6e23b3b` | Desktop-mode `✕` close-button fill |
 | `hide_top_layers` | bool (0/1) | `0` | Fade out Top layer surfaces (bars, e.g. Waybar) while open |
 | `hide_overlay_layers` | bool (0/1) | `0` | Fade out Overlay layer surfaces (popups/notifications) while open |

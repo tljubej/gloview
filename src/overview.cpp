@@ -113,10 +113,17 @@ int pxr(double round, double s) {
 // independently from interpolated fragment distances (`smallest > thick` on pixel centers), so a
 // fractional edge renders one px thicker/thinner than the others.
 void renderRing(const CBox& boxPx, const CHyprColor& col, double roundPx, double thickLg) {
-    if (thickLg < 1.0 || boxPx.w <= 0.0 || boxPx.h <= 0.0 || col.a <= 0.0)
+    if (thickLg < 1.0 || col.a <= 0.0)
         return;
     CBox snapped = boxPx;
     snapped.round();
+    // Reject a degenerate box AFTER snapping, never before: Hyprland's renderBorder RASSERTs on a
+    // zero-size box (SIGABRT — the whole session goes down), and a sub-pixel box passes a `> 0`
+    // test on boxPx yet rounds to 0×0 right here. The add-workspace pop-in hands us exactly that
+    // on its first frame (newCardScale() starts at ~2e-16, so the clicked card is ~5e-14 px
+    // wide): that was the "clicking the empty workspace card crashes Hyprland" bug.
+    if (snapped.w < 1.0 || snapped.h < 1.0)
+        return;
     const Config::CGradientValueData grad(col);
     g_pHyprOpenGL->renderBorder(snapped, grad, {.round = static_cast<int>(roundPx), .roundingPower = 2.F, .borderSize = static_cast<int>(std::round(thickLg)), .a = 1.F});
 }
@@ -1821,6 +1828,8 @@ void Overview::renderStrip() const {
         const auto&  it     = m_strip[i];
         const LRect  card   = stripCardBox(i, slide, scroll);
         const CBox   c      = box(card);
+        if (card.w < 1.0 || card.h < 1.0)
+            continue; // first pop-in frame: nothing to draw yet, and renderRect asserts on a zero-size box
 
         // card rings are drawn later, over the live card previews (renderStripRings)
         const bool actLike = it.active || (allWs && allCardShown && it.isAll); // filled + thick ring
@@ -1984,9 +1993,12 @@ void Overview::renderStripRings() const {
         const bool  ring     = actLike || expoRing;
         if (!ring && !hover)
             continue;
-        const auto&  lc = ring ? activeLine : hoverLine;
-        const double t  = ring ? activeSize : hoverSize;
-        renderRing(pxb(stripCardBox(i, slide, scroll), s), lc, cardRound * s, t);
+        const auto&  lc   = ring ? activeLine : hoverLine;
+        const double t    = ring ? activeSize : hoverSize;
+        const LRect  card = stripCardBox(i, slide, scroll);
+        if (card.w < 1.0 || card.h < 1.0)
+            continue; // mid pop-in from scale 0: no card to ring yet (renderRing guards too)
+        renderRing(pxb(card, s), lc, cardRound * s, t);
     }
 }
 
@@ -2542,15 +2554,19 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
         }
 
         // strip card → switch the displayed workspace right away (no drag here); the
-        // "+" card creates a new workspace (addWorkspace handles follow + pop-in anim).
+        // "+" card creates a new workspace (addWorkspace handles follow + pop-in anim). A card
+        // with nothing on it to pick — dynamic_workspaces' trailing empty card, or a listed
+        // empty workspace — is a destination, not a view: go there and dismiss (activateWorkspace).
         for (size_t i = 0; i < m_strip.size(); ++i) {
             const LRect c = stripCardAt(i);
             if (lx >= c.x && ly >= c.y && lx <= c.x + c.w && ly <= c.y + c.h) {
                 m_pressTile = PRESS_STRIP;
                 if (m_strip[i].isAll)
                     toggleAllWorkspaces();
+                else if (m_strip[i].isNew || (!m_strip[i].isPlus && m_strip[i].wins.empty()))
+                    activateWorkspace(m_strip[i]);
                 else if (m_strip[i].isPlus)
-                    addWorkspace(m_strip[i].id); // 0 for the plain "+"; the advertised id for the dynamic tail
+                    addWorkspace(m_strip[i].id); // the plain "+": create it (switch_on_new_workspace decides whether the display follows)
                 else
                     switchToWorkspace(m_strip[i]);
                 return true;
@@ -2798,6 +2814,20 @@ void Overview::switchToWorkspace(const StripItem& it) {
     m_reflowing = false;
     m_animStart = std::chrono::steady_clock::now() - std::chrono::milliseconds(std::max(1, cfgInt("plugin:gloview:duration", 360)));
     damage();
+}
+
+// A click on a workspace card with nothing on it to pick: dynamic_workspaces' trailing empty
+// card, or any listed empty workspace. Displaying a blank desktop inside the overview is a dead
+// end — the only thing left to do with it is to go there — so it behaves like picking a window:
+// display it (which creates the create-on-use card's workspace), then close, which commits it
+// to the live desktop. Takes the item by VALUE: switchToWorkspace rebuilds m_strip, so a
+// reference into it would dangle.
+void Overview::activateWorkspace(StripItem it) {
+    if (it.isAll || !m_active)
+        return;
+    switchToWorkspace(it); // no-op when it is already the displayed workspace
+    dbg("empty workspace card " + std::to_string(it.id) + " clicked: closing onto it");
+    close();
 }
 
 // Push the displayed workspace onto the live desktop. Run at the START of the close
