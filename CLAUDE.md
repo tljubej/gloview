@@ -342,6 +342,24 @@ toggle (read live). The load-bearing rules:
   same-workspace path only moves input focus, no `exit_on_switch` trip). Verified in the VM
   (A/B: hovering tile B with focus on A → killactive closes B with the fix, A without it).
   NOTE this leaves focus on the last-selected tile after an Esc close — intentional.
+- **The overview OWNS the pointer while up: `onMouseMove` CANCELS `input.mouse.move`.**
+  Hyprland's `mouseMoveUnified` emits that event first and, uncancelled, hit-tests the REAL
+  window geometry, hands the seat's pointer focus to the hidden window under the cursor and
+  streams `wl_pointer.motion` into it — a phantom pointer (browser hover highlights lit up
+  inside the live previews), and with `follow_mouse` it also dragged KEYBOARD focus off the
+  `syncFocus` tile onto that hidden window. Cancelled only while the cursor is on the
+  overview's monitor (`ownsPointerAt`) — other monitors' windows are visible and must keep
+  their routing; the one skipped side effect that still matters, focusing the monitor the
+  cursor crossed onto, is replayed there. `releasePointerFocus` (open, every cancelled
+  motion, after `syncFocus`) clears focus Hyprland hands out on other paths (map, unmap
+  fallback, `follow_mouse=0`'s `sendMotionEventsToFocused`) and resets the cursor to
+  `left_ptr` — a client can only shape it while focused, and the normal reset sits past the
+  cancelled emit. `restorePointerFocus` (deactivate/hardClose) hands the pointer to the
+  focused window via `sendMotionEventsToFocused`, so a wheel tick or a click on the picked
+  window works before the cursor moves again — never `simulateMouseMovement`, which with
+  `follow_mouse=1` refocuses the window under the cursor and steals the pick. Verified in
+  the nested VM with `wev` logging what the hidden window receives: 8/8 sweep motions before,
+  0 after, a leave at open and an enter right after close.
 - **Clicking an EMPTY strip card goes there and closes** — `activateWorkspace` =
   `switchToWorkspace` (which creates the create-on-use tail's workspace) + `close()` (which
   commits it). Covers `dynamic_workspaces`' trailing `isNew` card and any listed workspace with
