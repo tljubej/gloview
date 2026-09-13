@@ -152,6 +152,16 @@ surface's corner and the two leave **gaps**. Ring drawing lives in `drawPreviewR
 `renderStripRings`, never in `drawPreviewTile` / `renderStrip` (those are Back/Mid phases, i.e.
 *under* the surfaces).
 
+**`renderRing` rejects a box whose SNAPPED size is under 1px** (and `renderStrip` /
+`renderStripRings` skip such cards outright). Hyprland's `renderBorder` / `renderRect` `RASSERT`
+on a zero-size box, and an assert in the compositor is a SIGABRT of the whole session. The
+add-workspace pop-in produced exactly that: `newCardScale()` starts at ~2e-16, not 0 (easeOutBack
+at p=0 in doubles), so the clicked card's box was ~5e-14 px wide — it passed a `> 0` pre-check on
+the unsnapped box and then `CBox::round()`ed to 0×0 inside `renderRing`. That was the "clicking
+the empty workspace card crashes Hyprland" bug (crash reports: `renderStripRings` → local frame →
+an assert mis-symbolized as `assertImpl<int&,int&>`, which is just the nearest exported symbol).
+Test the size AFTER rounding, never before.
+
 **Both the strip cards and the main-area tiles render LIVE window surfaces**
 (`renderWindowLive`, ported from Hyprspace's `renderWindowStub`: render-modif TRANSLATE+SCALE
 + `CSurfacePassElement` per surface), not snapshot textures — robust for windows on hidden
@@ -284,7 +294,8 @@ slide away). Consequences:
 - **`addWorkspace()`** (the `+`/empty card): a brand-new empty workspace is reaped within a
   frame or two unless focused, so it is held `setPersistent(true)` (tracked in `m_newWs`) for
   the overview's lifetime and released on `deactivate()`/`close()`/dtor.
-  `switch_on_new_workspace` decides whether to follow the display to it.
+  `switch_on_new_workspace` decides whether to follow the display to it. Only the plain `+` card
+  reaches it now: a click on the dynamic trailing card is `activateWorkspace` (below).
 - **Workspace-switch slide**: `beginWsSlide` freezes the outgoing tiles into `m_prevTiles` and
   slides them off one edge while the incoming set slides in. Purely visual — the frozen set
   never takes hover/selection/drag and is dropped when the slide ends.
@@ -331,6 +342,14 @@ toggle (read live). The load-bearing rules:
   same-workspace path only moves input focus, no `exit_on_switch` trip). Verified in the VM
   (A/B: hovering tile B with focus on A → killactive closes B with the fix, A without it).
   NOTE this leaves focus on the last-selected tile after an Esc close — intentional.
+- **Clicking an EMPTY strip card goes there and closes** — `activateWorkspace` =
+  `switchToWorkspace` (which creates the create-on-use tail's workspace) + `close()` (which
+  commits it). Covers `dynamic_workspaces`' trailing `isNew` card and any listed workspace with
+  no mapped windows (`wins.empty()`), the active one included. A populated card only changes the
+  *displayed* workspace, and the plain non-dynamic `+` still goes through `addWorkspace` /
+  `switch_on_new_workspace`. Displaying a blank desktop inside the overview was a dead end that
+  users read as "the empty workspace doesn't open". Takes the `StripItem` by value:
+  `switchToWorkspace` rebuilds `m_strip` under a reference.
 - **Closing a window** is async: `sendClose()` doesn't unmap immediately. `syncTiles()` runs
   each frame and, when a tile's weak window ptr goes null (or the window set changes),
   rebuilds + `replayReflow`s the survivors. `replayReflow` is the shared reflow tail (also

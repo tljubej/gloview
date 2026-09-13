@@ -326,6 +326,7 @@ class Overview {
     void   drawPreviewRing(size_t i, const LRect& slot, bool lift) const; // hover/selection ring, over the live surface
     LRect  stripCardBox(size_t i, const Vector2D& slide, const Vector2D& scroll) const; // card box incl. scroll + pop-in
     void   switchToWorkspace(const StripItem& it);
+    void   activateWorkspace(StripItem it);   // click on an EMPTY card (create-on-use tail, or a listed empty workspace): display it, then close onto it
     void   commitWorkspace();                 // push the displayed workspace to the live desktop, warping Hyprland's own slide away
     void   dropOnWorkspace(const PHLWINDOW& w, const StripItem& it, const LRect& fromBox);
     void   swapTiles(int a, int b);           // drag a preview onto another → swap the two windows' places (real layout + overview)
