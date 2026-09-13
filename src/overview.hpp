@@ -102,7 +102,10 @@ class Overview {
     void renderAboveLayers() const; // re-render opted-in TOP/OVERLAY layer surfaces on top of the overview
     bool onMouseButton(const IPointer::SButtonEvent& e);
     bool onMouseAxis(const IPointer::SAxisEvent& e); // scroll the workspace strip when it overflows
-    void onMouseMove();
+    // Pointer motion. Returns true to CANCEL Hyprland's own handling (mouseMoveUnified): while
+    // the overview owns the pointer no hidden window may get the enter/motion Hyprland would
+    // otherwise route to the surface under the cursor's REAL geometry (see the definition).
+    bool onMouseMove(const Vector2D& coords);
     void updateHover(); // recompute hovered tile/card from current cursor pos
     void onKey(const IKeyboard::SKeyEvent& e, bool& cancel);
     bool shouldHideWindow(const PHLWINDOW& w, const PHLMONITOR& m) const;
@@ -342,6 +345,9 @@ class Overview {
     void   activateSelection();               // focus the selected window and dismiss
     void   activateWindow(const PHLWINDOW& w, bool keybind); // …the shared path: follow the window's workspace, then dismiss + focus
     void   syncFocus() const;                 // point Hyprland's real focus at the selected tile (passthrough keybinds)
+    bool   ownsPointerAt(const Vector2D& coords) const; // active AND the point is on the overview's monitor: pointer input is ours, not the hidden windows'
+    void   releasePointerFocus() const;       // take the seat's pointer focus off whatever surface holds it (a hidden window) + reset the cursor shape
+    void   restorePointerFocus() const;       // after teardown: hand the pointer to the focused window, the way a focus change does
     void   closeTileWindow(int i);            // send-close a tile's window, then reflow the rest
     void   replayReflow(std::vector<std::pair<PHLWINDOW, LRect>>& oldBoxes); // glide tiles into new slots after a removal
     void   syncTiles();                       // add/drop tiles when the displayed workspace's window set changes, then reflow

@@ -24,6 +24,8 @@
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/helpers/Color.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
+#include <hyprland/src/managers/SeatManager.hpp>
+#include <hyprland/src/config/ConfigValue.hpp>
 #include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
@@ -491,7 +493,10 @@ bool Overview::initialize() {
         if (onMouseAxis(event))
             info.cancelled = true;
     });
-    m_mouseMoveL = events.input.mouse.move.listen([this](const Vector2D&, Event::SCallbackInfo&) { onMouseMove(); });
+    m_mouseMoveL = events.input.mouse.move.listen([this](const Vector2D& coords, Event::SCallbackInfo& info) {
+        if (onMouseMove(coords))
+            info.cancelled = true;
+    });
     m_keyL       = events.input.keyboard.key.listen([this](const IKeyboard::SKeyEvent& event, Event::SCallbackInfo& info) {
         bool cancel = false;
         onKey(event, cancel);
@@ -886,6 +891,10 @@ void Overview::open() {
     m_progress  = 0.0;
     m_animStart = std::chrono::steady_clock::now();
     hideLayers(); // fade bars out (no-op unless hide_top/overlay_layers set)
+    // The window under the cursor holds the pointer right now; from here on it is hidden and
+    // the pointer is ours (onMouseMove). Send it its leave, else it keeps hover state until
+    // the first motion, and put the plain arrow up in place of whatever shape it had set.
+    releasePointerFocus();
     damage();
 }
 
@@ -991,6 +1000,7 @@ void Overview::hardClose() {
     m_hovered = m_hoveredStrip = -1;
     m_selected                 = -1;
 
+    restorePointerFocus(); // the .so is about to go: leave the seat routing to a real window
     damage(); // schedule the plugin-free flush frame
 }
 
@@ -2423,12 +2433,70 @@ bool Overview::onMouseAxis(const IPointer::SAxisEvent& e) {
     return true;
 }
 
-void Overview::onMouseMove() {
+bool Overview::onMouseMove(const Vector2D& coords) {
+    if (!m_active)
+        return false;
     updateHover();
     // We repaint the cursor ourselves (renderCursorOnTop). updateHover only damages on hover
     // *change*, so moving within one tile would leave the old cursor → trail. Damage every move.
-    if (m_active)
-        damage();
+    damage();
+
+    // Cancel Hyprland's own handling. mouseMoveUnified emits this event FIRST and, unless
+    // cancelled, hit-tests the REAL window geometry, hands the seat's pointer focus to the
+    // window under the cursor (wl_pointer.enter) and streams wl_pointer.motion into it — a
+    // window this overlay hides. The client saw a phantom pointer wander over it (browser
+    // hover highlights lighting up inside the live preview), and with follow_mouse Hyprland
+    // also moved KEYBOARD focus to it, undoing syncFocus() so a passthrough bind hit the wrong
+    // window. Only while the cursor is on the overview's monitor: another monitor's windows
+    // are visible and interactive, so its routing must keep running untouched.
+    const auto m = m_monitor.lock();
+    if (!m || !ownsPointerAt(coords))
+        return false;
+
+    // The one thing in the cancelled tail that still applies here: crossing onto this monitor
+    // focuses it (misc:mouse_move_focuses_monitor), so passthrough binds act on it.
+    static auto PMOUSEFOCUSMON = CConfigValue<Config::INTEGER>("misc:mouse_move_focuses_monitor");
+    if (*PMOUSEFOCUSMON && Desktop::focusState()->monitor() != m && g_pInputManager->m_forcedFocus.expired())
+        Desktop::focusState()->rawMonitorFocus(m);
+
+    // Hyprland hands pointer focus out from more places than the path cancelled above (a
+    // window mapping, the unmap fallback focus, rawWindowFocus with follow_mouse=0): take
+    // back whatever it gave out since the last motion.
+    releasePointerFocus();
+    return true;
+}
+
+bool Overview::ownsPointerAt(const Vector2D& coords) const {
+    if (!m_active)
+        return false;
+    const auto m = m_monitor.lock();
+    return m && State::monitorState()->query().vec(coords).run() == m;
+}
+
+void Overview::releasePointerFocus() const {
+    if (!g_pSeatManager || !g_pInputManager || !g_pSeatManager->m_state.pointerFocus)
+        return;
+    if (!ownsPointerAt(g_pInputManager->getMouseCoordsInternal()))
+        return; // the cursor is on another monitor: that focus is legitimately its window's
+    g_pSeatManager->setPointerFocus(nullptr, {}); // wl_pointer.leave to whoever held it
+    // A client can only shape the cursor while it holds pointer focus, and mouseMoveUnified's
+    // own "left_ptr over nothing" reset sits PAST the emit onMouseMove cancels — so the last
+    // hovered app's I-beam/hand would stay up for the whole overview without this.
+    if (g_pHyprRenderer)
+        g_pHyprRenderer->setCursorFromName("left_ptr");
+}
+
+void Overview::restorePointerFocus() const {
+    if (!g_pInputManager || !g_pSeatManager || g_pSeatManager->m_state.pointerFocus)
+        return; // never released (cursor sat on another monitor), or Hyprland re-routed already
+    // Hyprland's motion path routes again from the next event, but until the cursor moves
+    // nobody holds the pointer — a wheel tick, or a click on the very window just picked
+    // (processMouseDownNormal only refocuses when the window under the cursor is NOT the
+    // focused one), would go nowhere. Hand it to the focused window the way a focus change
+    // does (sendMotionEventsToFocused); wheel/click/motion over anything else re-route through
+    // Hyprland's own paths. NOT simulateMouseMovement(): with follow_mouse=1 that refocuses
+    // the window under the cursor and steals the pick.
+    g_pInputManager->sendMotionEventsToFocused();
 }
 
 void Overview::updateHover() {
@@ -3286,6 +3354,9 @@ void Overview::syncFocus() const {
     if (w->m_workspace != m->m_activeWorkspace) // displaying a non-live workspace — don't desync
         return;
     Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_KEYBIND);
+    // With follow_mouse=0 rawWindowFocus ends in sendMotionEventsToFocused(): a pointer enter
+    // into the hidden window we just focused. The overview owns the pointer — take it back.
+    releasePointerFocus();
 }
 
 // Rebuild tiles/strip, then glide each survivor from its captured box into its new slot
@@ -3602,6 +3673,7 @@ void Overview::deactivate() {
     m_recaptureLeft = 0;
     if (m_recaptureTimer)
         m_recaptureTimer->cancel();
+    restorePointerFocus(); // after m_active is off: ownsPointerAt() no longer claims the pointer
     damage();
 }
 
