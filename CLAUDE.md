@@ -342,6 +342,12 @@ toggle (read live). The load-bearing rules:
   same-workspace path only moves input focus, no `exit_on_switch` trip). Verified in the VM
   (A/B: hovering tile B with focus on A → killactive closes B with the fix, A without it).
   NOTE this leaves focus on the last-selected tile after an Esc close — intentional.
+  **It skips any window under a fullscreen one** (same trigger as Hyprland's own check:
+  `getFullscreenWindow(ws)` is set, isn't the target and isn't `layoutManagedFS`).
+  `fullWindowFocus` applies `misc:on_focus_under_fullscreen` (default 2 UNFULLSCREENS the
+  game), raises a floating window over the fullscreen one, and steals the game's keyboard focus
+  and pointer lock. Before this guard, just hovering another tile on a fullscreen game's
+  workspace did all of that.
 - **The overview OWNS the pointer while up: `onMouseMove` CANCELS `input.mouse.move`.**
   Hyprland's `mouseMoveUnified` emits that event first and, uncancelled, hit-tests the REAL
   window geometry, hands the seat's pointer focus to the hidden window under the cursor and
@@ -360,6 +366,14 @@ toggle (read live). The load-bearing rules:
   `follow_mouse=1` refocuses the window under the cursor and steals the pick. Verified in
   the nested VM with `wev` logging what the hidden window receives: 8/8 sweep motions before,
   0 after, a leave at open and an enter right after close.
+  **Pointer-locked clients (games) need the explicit re-enter in `restorePointerFocus`.** A
+  game in mouselook holds a `zwp_locked_pointer` (Xwayland creates one for a Wine/Proton game's
+  hidden cursor + ClipCursor). Hyprland ties constraints to KEYBOARD focus, so the lock stays
+  active through the overview, and `sendMotionEventsToFocused` bails on `isConstrained()`. The
+  locked motion path only warps the cursor, and clicks don't refocus. Without the re-enter at
+  the lock hint, the game never got pointer focus back: no relative motion, no buttons, a dead
+  mouse until keyboard focus left and returned. Verified in the nested VM with a lock client:
+  0 motions/clicks after close before the fix, all of them after.
 - **Clicking an EMPTY strip card goes there and closes** — `activateWorkspace` =
   `switchToWorkspace` (which creates the create-on-use tail's workspace) + `close()` (which
   commits it). Covers `dynamic_workspaces`' trailing `isNew` card and any listed workspace with
