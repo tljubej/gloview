@@ -40,6 +40,7 @@
 #include <hyprland/src/render/pass/RendererHintsPassElement.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprland/src/protocols/PointerConstraints.hpp>
+#include <hyprland/src/pointer/cursor/CursorShapeOverrideController.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
 
@@ -378,6 +379,19 @@ bool hkShouldRenderWindowAny(void* thisptr, PHLWINDOW window) {
     return g_shouldRenderWindowOrig ? g_shouldRenderWindowOrig(thisptr, window) : true;
 }
 
+using PSENDRELATIVEMOTION                  = void (*)(void*, uint64_t, const Vector2D&, const Vector2D&);
+PSENDRELATIVEMOTION g_sendRelativeMotionOrig = nullptr;
+
+// onMouseMoved sends relative motion BEFORE the cancellable input.mouse.move event, so gloview
+// can't stop it there. A pointer-locked game keeps its pointer focus while the overview is up
+// (releasePointerFocus), and without this every mouse move would turn its camera behind the overlay.
+void hkSendRelativeMotion(void* thisptr, uint64_t timeUs, const Vector2D& delta, const Vector2D& deltaUnaccel) {
+    if (g_overview && g_overview->ownsPointer())
+        return;
+    if (g_sendRelativeMotionOrig)
+        g_sendRelativeMotionOrig(thisptr, timeUs, delta, deltaUnaccel);
+}
+
 CHyprColor argb(Hyprlang::INT raw, double alphaMul = 1.0) {
     const auto a = static_cast<double>((raw >> 24) & 0xFF) / 255.0;
     const auto r = static_cast<double>((raw >> 16) & 0xFF) / 255.0;
@@ -484,8 +498,15 @@ Overview::~Overview() {
         HyprlandAPI::removeFunctionHook(m_handle, m_shouldRenderWindowHook);
         m_shouldRenderWindowHook = nullptr;
     }
+    if (m_relativeMotionHook) {
+        HyprlandAPI::removeFunctionHook(m_handle, m_relativeMotionHook);
+        m_relativeMotionHook = nullptr;
+    }
+    if (m_cursorOverridden) // never leave every app's cursor stuck on our arrow
+        Pointer::Cursor::overrideController->unsetOverride(Pointer::Cursor::CURSOR_OVERRIDE_SPECIAL_ACTION);
     g_shouldRenderOrig       = nullptr;
     g_shouldRenderWindowOrig = nullptr;
+    g_sendRelativeMotionOrig = nullptr;
 }
 
 bool Overview::initialize() {
@@ -561,6 +582,22 @@ bool Overview::initialize() {
         return false;
     }
     g_shouldRenderWindowOrig = reinterpret_cast<PSHOULDRENDERWINDOW>(m_shouldRenderWindowHook->m_original);
+
+    // Optional: relative-motion filter. Two classes export a sendRelativeMotion (the per-resource
+    // CRelativePointer and the protocol-wide CRelativePointerProtocol); only the protocol one is the
+    // entry onMouseMoved calls. Without the hook, constrained clients are released like any other.
+    for (const auto& mt : HyprlandAPI::findFunctionsByName(m_handle, "sendRelativeMotion")) {
+        if (mt.demangled.find("CRelativePointerProtocol::sendRelativeMotion(") == std::string::npos)
+            continue;
+        m_relativeMotionHook = HyprlandAPI::createFunctionHook(m_handle, mt.address, reinterpret_cast<void*>(&hkSendRelativeMotion));
+        if (m_relativeMotionHook && m_relativeMotionHook->hook())
+            g_sendRelativeMotionOrig = reinterpret_cast<PSENDRELATIVEMOTION>(m_relativeMotionHook->m_original);
+        else if (m_relativeMotionHook) {
+            HyprlandAPI::removeFunctionHook(m_handle, m_relativeMotionHook);
+            m_relativeMotionHook = nullptr;
+        }
+        break;
+    }
     return true;
 }
 
@@ -1045,8 +1082,29 @@ bool Overview::tileBelongs(const PHLWINDOW& w, const PHLMONITOR& m, const PHLWOR
 bool Overview::onLiveDesktop(const PHLWINDOW& w, const PHLMONITOR& m, const PHLWORKSPACE& live) const {
     if (!w || !m)
         return true;
+    if (coveringFullscreen(w))
+        return false; // hidden under a fullscreen window: not on screen either side of the overlay
     const auto wws = w->m_workspace;
     return !wws || wws == live || wws == m->m_activeSpecialWorkspace;
+}
+
+// The window that hides tiled `w` by being fullscreen on its workspace, or null. Hyprland draws
+// only FLOATING windows over a fullscreen one, so a tiled window there can't be shown without
+// un-fullscreening it: fullWindowFocus applies misc:on_focus_under_fullscreen (default 2
+// un-fullscreens; 1 hands fullscreen over). A Proton game answers that by leaving fullscreen and
+// asking to be minimized, which Hyprland ignores — Wine then treats the game as minimized, it
+// freezes on a paused frame, and later falls out as a stray window between monitors. Hence the
+// overview never un-fullscreens: such a tile is dimmed and picking it returns to the fullscreen
+// window (activateWindow). Same trigger as Hyprland's own check, but only true fullscreen:
+// un-maximizing is harmless and nothing fights it. A floating window is excluded: focusing one
+// raises it over the fullscreen window instead.
+PHLWINDOW Overview::coveringFullscreen(const PHLWINDOW& w) const {
+    if (!w || !w->m_workspace || w->m_isFloating)
+        return nullptr;
+    const auto fs = Fullscreen::controller()->getFullscreenWindow(w->m_workspace);
+    if (!fs || fs == w || Fullscreen::controller()->layoutManagedFS(fs) || Fullscreen::controller()->getFullscreenModes(fs).internal != Fullscreen::FSMODE_FULLSCREEN)
+        return nullptr;
+    return fs;
 }
 
 void Overview::buildTiles() {
@@ -1874,6 +1932,8 @@ void Overview::renderStrip() const {
                     continue;
                 if (isFlying(w))
                     continue; // still arriving; renderFlyTile is drawing it
+                if (coveringFullscreen(w))
+                    continue; // hidden under a fullscreen window: the card shows the workspace as it looks
                 // inset 1px so the backing stays under the live surface and can't peek as a
                 // thin dark edge line (see drawPreviewTile), then CROP to the card. A window
                 // whose tiled slot falls partly outside the monitor (floating/offscreen/
@@ -1938,6 +1998,8 @@ void Overview::renderStripWindows() const {
                 continue;
             if (isFlying(w))
                 continue; // still arriving; renderFlyWindow is drawing it
+            if (coveringFullscreen(w))
+                continue; // hidden under a fullscreen window (renderStrip skips its backing too)
             // window slot inside the card, from its tiled goal position (logical)
             const LRect slot{card.x + sw.rel.x * card.w, card.y + sw.rel.y * card.h, std::max(2.0, sw.rel.w * card.w),
                              std::max(2.0, sw.rel.h * card.h)};
@@ -2199,7 +2261,10 @@ void Overview::renderMainWindows() const {
                 continue;
             const LRect lb = tileContentBox(i, currentBox(m_tiles[i], static_cast<int>(i)));
             const CBox  px(lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale);
-            renderWindowLive(w, m, px, px, fading ? static_cast<float>(e) : 1.0F, when, m_previewFilterGrid, round);
+            // a window hidden under a fullscreen one is dimmed (over its dark backing): picking it
+            // returns to the fullscreen window, see coveringFullscreen
+            const float dim = coveringFullscreen(w) ? 0.4F : 1.0F;
+            renderWindowLive(w, m, px, px, (fading ? static_cast<float>(e) : 1.0F) * dim, when, m_previewFilterGrid, round);
         }
 }
 
@@ -2486,11 +2551,31 @@ bool Overview::ownsPointerAt(const Vector2D& coords) const {
     return m && State::monitorState()->query().vec(coords).run() == m;
 }
 
+bool Overview::ownsPointer() const {
+    return g_pInputManager && ownsPointerAt(g_pInputManager->getMouseCoordsInternal());
+}
+
 void Overview::releasePointerFocus() const {
     if (!g_pSeatManager || !g_pInputManager || !g_pSeatManager->m_state.pointerFocus)
         return;
     if (!ownsPointerAt(g_pInputManager->getMouseCoordsInternal()))
         return; // the cursor is on another monitor: that focus is legitimately its window's
+    // A pointer-LOCKED/confined client — a game in mouselook — keeps its pointer focus. Pulling it
+    // left Proton games mouse-dead: Hyprland ties constraints to KEYBOARD focus, so the lock stayed
+    // active while the game got a wl_pointer.leave, and every focus change during a switch made
+    // Hyprland hand the pointer back (constraint activate) only for this to take it again — an
+    // enter/leave churn under an active lock that a keybind workspace switch never produces.
+    // Kept, it sees nothing at all while the overview is up: motion is cancelled
+    // (onMouseMove), buttons and the wheel are swallowed, relative motion is dropped by the
+    // sendRelativeMotion hook — so only with that hook in place. Its hidden cursor would hide ours
+    // too, hence the arrow override (undone in restorePointerFocus).
+    if (m_relativeMotionHook && g_pInputManager->isConstrained() && g_pSeatManager->m_state.pointerFocus == Desktop::focusState()->surface()) {
+        if (!m_cursorOverridden) {
+            Pointer::Cursor::overrideController->setOverride("left_ptr", Pointer::Cursor::CURSOR_OVERRIDE_SPECIAL_ACTION);
+            m_cursorOverridden = true;
+        }
+        return;
+    }
     g_pSeatManager->setPointerFocus(nullptr, {}); // wl_pointer.leave to whoever held it
     // A client can only shape the cursor while it holds pointer focus, and mouseMoveUnified's
     // own "left_ptr over nothing" reset sits PAST the emit onMouseMove cancels — so the last
@@ -2500,17 +2585,30 @@ void Overview::releasePointerFocus() const {
 }
 
 void Overview::restorePointerFocus() const {
-    if (!g_pInputManager || !g_pSeatManager || g_pSeatManager->m_state.pointerFocus)
-        return; // never released (cursor sat on another monitor), or Hyprland re-routed already
-    // A pointer-LOCKED client — a game in mouselook: Xwayland locks the pointer for a Wine/Proton
-    // game's hidden cursor + ClipCursor — keeps its constraint ACTIVE through the overview, since
-    // Hyprland ties constraints to KEYBOARD focus and that never left it. Only its pointer focus was
-    // taken (releasePointerFocus), and Hyprland has no path that hands it back while it is
-    // constrained: sendMotionEventsToFocused() bails on isConstrained(), the locked motion path only
-    // warps the cursor to the lock hint, and a click doesn't refocus. Relative motion and buttons
-    // both go to the pointer focus, so the game was left mouse-dead until keyboard focus left and
-    // came back. Re-enter it at the lock hint, as CPointerConstraint::activate() does, and replay a
-    // motion so the cursor goes back to the hint (or into a confine region).
+    if (m_cursorOverridden) { // the kept game's own (hidden) cursor comes back
+        Pointer::Cursor::overrideController->unsetOverride(Pointer::Cursor::CURSOR_OVERRIDE_SPECIAL_ACTION);
+        m_cursorOverridden = false;
+    }
+    if (!g_pInputManager || !g_pSeatManager)
+        return;
+    if (const auto held = g_pSeatManager->m_state.pointerFocus.lock()) {
+        // Still held. Fine if the cursor is on another monitor (that's its window's) or the holder
+        // is the focused window (a kept game). A KEPT pointer whose game lost keyboard focus
+        // meanwhile (another window was picked) is stale: hand it to the focused window below,
+        // else a click before the next motion lands in the now-hidden game.
+        const auto m = m_monitor.lock();
+        if (!m || State::monitorState()->query().vec(g_pInputManager->getMouseCoordsInternal()).run() != m || held == Desktop::focusState()->surface())
+            return;
+        g_pSeatManager->setPointerFocus(nullptr, {});
+    }
+    // Fallback for a constrained client that ended up WITHOUT pointer focus (no relative-motion
+    // hook, so releasePointerFocus couldn't keep it; or it was constrained while focus was
+    // elsewhere). Hyprland has no path that hands the pointer back while it is constrained:
+    // sendMotionEventsToFocused() bails on isConstrained(), the locked motion path only warps the
+    // cursor to the lock hint, and a click doesn't refocus. Relative motion and buttons both go to
+    // the pointer focus, so the game was left mouse-dead until keyboard focus left and came back.
+    // Re-enter it at the lock hint, as CPointerConstraint::activate() does, and replay a motion so
+    // the cursor goes back to the hint (or into a confine region).
     if (g_pInputManager->isConstrained()) {
         const auto surf       = Desktop::View::CWLSurface::fromResource(Desktop::focusState()->surface());
         const auto constraint = surf ? surf->constraint() : nullptr;
@@ -2580,8 +2678,11 @@ void Overview::updateHover() {
         m_hovered      = newTile;
         m_hoveredStrip = newStrip;
         // keep the keyboard selection under the pointer so arrow-nav picks up where
-        // the mouse left off (macOS-like). Only when actually over a tile.
-        if (newTile >= 0 && cfgInt("plugin:gloview:focus_follows_mouse", 1) != 0) {
+        // the mouse left off (macOS-like). Only when actually over a tile, and only while open:
+        // during the close glide tiles slide under a still cursor, and syncing focus then stole
+        // it back from the window just picked (pick Steam, the game's tile glides under the
+        // cursor, the game is focused again).
+        if (newTile >= 0 && m_opening && cfgInt("plugin:gloview:focus_follows_mouse", 1) != 0) {
             m_selected = newTile;
             syncFocus(); // so a passthrough killactive/hotkey hits the hovered window
         }
@@ -3371,7 +3472,10 @@ void Overview::activateSelection() {
 // In the all-workspaces (expo) view the tile can live on a workspace OTHER than the displayed
 // one, and close() commits m_workspace — so without retargeting it first the overview closed
 // back onto the workspace you started on and merely raised a window you could not see.
-void Overview::activateWindow(const PHLWINDOW& w, bool keybind) {
+void Overview::activateWindow(const PHLWINDOW& picked, bool keybind) {
+    // A tile under a fullscreen window returns to that window instead (see coveringFullscreen).
+    const auto fs = coveringFullscreen(picked);
+    const auto w  = fs ? fs : picked;
     if (w) {
         const auto m  = m_monitor.lock();
         const auto ws = w->m_workspace;
@@ -3381,8 +3485,13 @@ void Overview::activateWindow(const PHLWINDOW& w, bool keybind) {
             m_workspace = ws;
     }
     close();
-    if (w)
+    // close() committed the workspace, which already focused its last window, usually this one.
+    // Skip the redundant re-focus (see syncFocus: for an X11 window it re-sends configure/state).
+    if (w && Desktop::focusState()->window() != w)
         Desktop::focusState()->fullWindowFocus(w, keybind ? Desktop::FOCUS_REASON_KEYBIND : Desktop::FOCUS_REASON_CLICK);
+    // Keyboard focus may have just left a game whose pointer focus we kept: take it now, the
+    // moment a keybind switch would move it, not on the next motion.
+    releasePointerFocus();
 }
 
 // Point Hyprland's REAL focus at the selected tile while the overview is up. passthrough
@@ -3411,6 +3520,11 @@ void Overview::syncFocus() const {
     // through the policy, like clicking that window normally would.
     const auto fs = Fullscreen::controller()->getFullscreenWindow(w->m_workspace);
     if (fs && fs != w && !Fullscreen::controller()->layoutManagedFS(fs))
+        return;
+    // Already focused: re-focusing is NOT a no-op for an X11 window. rawWindowFocus treats it as
+    // its own previous window, so Xwayland re-sends its configure, WM_STATE/_NET_WM_STATE and
+    // restack on every hover change — X traffic a real focus change never repeats.
+    if (Desktop::focusState()->window() == w)
         return;
     Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_KEYBIND);
     // With follow_mouse=0 rawWindowFocus ends in sendMotionEventsToFocused(): a pointer enter

@@ -115,6 +115,7 @@ class Overview {
     bool forceRenderWindow(const PHLWINDOW& w) const;
 
     [[nodiscard]] bool       active() const { return m_active; }
+    [[nodiscard]] bool       ownsPointer() const; // pointer input is the overview's right now (cursor on its monitor)
     [[nodiscard]] PHLMONITOR monitor() const { return m_monitor.lock(); }
     [[nodiscard]] bool       blurEnabled() const; // plugin:gloview:blur != 0 (queried by the pass)
 
@@ -267,6 +268,11 @@ class Overview {
     CHyprSignalListener m_keyL;
     CFunctionHook*      m_shouldRenderHook = nullptr;
     CFunctionHook*      m_shouldRenderWindowHook = nullptr; // one-arg shouldRenderWindow, used by makeSnapshot()
+    // CRelativePointerProtocol::sendRelativeMotion: dropped while the overview owns the pointer, so a
+    // pointer-locked game can KEEP its pointer focus (releasePointerFocus) without its camera turning
+    // behind the overview. Optional: without it, constrained clients get released like any other.
+    CFunctionHook*      m_relativeMotionHook = nullptr;
+    mutable bool        m_cursorOverridden = false; // we forced left_ptr over a kept game's hidden cursor
 
     // config helpers
     int           cfgInt(const char* name, int fallback) const;
@@ -298,6 +304,7 @@ class Overview {
     bool   showAllWorkspaces() const; // effective expo state: runtime override (m_allOverride) else plugin:gloview:show_all_workspaces
     bool   tileBelongs(const PHLWINDOW& w, const PHLMONITOR& m, const PHLWORKSPACE& ws) const; // shared main-area membership test (buildTiles + syncTiles MUST agree)
     bool   onLiveDesktop(const PHLWINDOW& w, const PHLMONITOR& m, const PHLWORKSPACE& live) const; // window is on the desktop the overlay hands over to/from (else Tile::fades)
+    PHLWINDOW coveringFullscreen(const PHLWINDOW& w) const; // the fullscreen window hiding tiled `w` on its workspace (picking `w` would un-fullscreen it), else null
     void   buildTiles();
     void   buildStrip();
     void   layoutTiles();

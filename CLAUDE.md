@@ -347,7 +347,31 @@ toggle (read live). The load-bearing rules:
   `fullWindowFocus` applies `misc:on_focus_under_fullscreen` (default 2 UNFULLSCREENS the
   game), raises a floating window over the fullscreen one, and steals the game's keyboard focus
   and pointer lock. Before this guard, just hovering another tile on a fullscreen game's
-  workspace did all of that.
+  workspace did all of that. **It also skips an already-focused window, and `activateWindow`
+  skips its re-focus when `close()`'s workspace commit already focused the pick.** Re-focusing
+  is not a no-op for X11: `rawWindowFocus` treats the window as its own previous one, so
+  Xwayland re-sends its configure, WM_STATE/`_NET_WM_STATE` and restack each time. **Hover
+  only syncs selection/focus while open (`m_opening`).** During the close glide, tiles slide
+  under a still cursor, and the synced focus stole the pick back: pick Steam, the game's tile
+  glides under the cursor, and the game is focused again.
+- **The overview never un-fullscreens a window (`coveringFullscreen`).** A TILED window on a
+  workspace with a true-fullscreen (`FSMODE_FULLSCREEN`) window is hidden under it. Hyprland
+  draws only floating windows over fullscreen, and focusing the tiled one applies
+  `misc:on_focus_under_fullscreen` (default 2 = un-fullscreen). A Proton game answers that by
+  leaving fullscreen and requesting a minimize, which **Hyprland ignores** (no X11 minimize
+  handling). Wine then treats the game as minimized: it freezes on a paused frame while its
+  menu still works, and later falls out as a stray window straddling monitors. Traced with
+  Horizon Forbidden West picking Steam on the game's workspace: `reqFS=0` → `configureRequest`
+  windowed → `reqMin=1`. (The same freeze happens with NO gloview involved whenever another
+  X11 app — Steam, Spotify via focus-follows-mouse — becomes `_NET_ACTIVE_WINDOW` while the game is
+  fullscreen: Proton deactivates it and the game minimizes itself. Wayland apps don't trigger it.
+  Not fixable here; a Wine virtual desktop or gamescope isolates the game.) So a covered tile is
+  drawn **dimmed** (live surface at 0.4 alpha over its dark backing). It is left out of its strip
+  card, handed off like expo's off-desktop tiles (`onLiveDesktop` → `Tile::fades`, so it doesn't
+  glide over the game on close), and picking it (`activateWindow`, click or Enter) returns to
+  the fullscreen window. Excluded on purpose: floating windows (focusing one raises it over the
+  fullscreen window, no un-fullscreen) and maximize / layout-managed fullscreen (un-maximizing
+  is harmless and nothing fights it).
 - **The overview OWNS the pointer while up: `onMouseMove` CANCELS `input.mouse.move`.**
   Hyprland's `mouseMoveUnified` emits that event first and, uncancelled, hit-tests the REAL
   window geometry, hands the seat's pointer focus to the hidden window under the cursor and
@@ -366,14 +390,29 @@ toggle (read live). The load-bearing rules:
   `follow_mouse=1` refocuses the window under the cursor and steals the pick. Verified in
   the nested VM with `wev` logging what the hidden window receives: 8/8 sweep motions before,
   0 after, a leave at open and an enter right after close.
-  **Pointer-locked clients (games) need the explicit re-enter in `restorePointerFocus`.** A
-  game in mouselook holds a `zwp_locked_pointer` (Xwayland creates one for a Wine/Proton game's
-  hidden cursor + ClipCursor). Hyprland ties constraints to KEYBOARD focus, so the lock stays
-  active through the overview, and `sendMotionEventsToFocused` bails on `isConstrained()`. The
-  locked motion path only warps the cursor, and clicks don't refocus. Without the re-enter at
-  the lock hint, the game never got pointer focus back: no relative motion, no buttons, a dead
-  mouse until keyboard focus left and returned. Verified in the nested VM with a lock client:
-  0 motions/clicks after close before the fix, all of them after.
+  **Pointer-locked clients (games) KEEP their pointer focus.** A game in mouselook holds a
+  `zwp_locked_pointer`/`zwp_confined_pointer` (Xwayland creates them for a Wine/Proton game's
+  hidden cursor + ClipCursor), and Hyprland ties constraints to KEYBOARD focus. So
+  `releasePointerFocus` skips the keyboard-focused surface while `isConstrained()`. Taking it left
+  the game focused, its lock active and its pointer gone. Every focus change during a gloview
+  switch then made Hyprland hand the pointer back (constraint `activate`) only for gloview to
+  take it again. That enter/leave churn left Horizon Forbidden West mouse-dead after the
+  overview; a keybind switch produces none of it. The kept game must still get nothing while
+  the overview is up. Motion
+  is cancelled and buttons and the wheel are swallowed already. **Relative motion is sent
+  before the cancellable event**, so `hkSendRelativeMotion` (a hook on
+  `CRelativePointerProtocol::sendRelativeMotion`) drops it while `ownsPointer()`. Without that
+  hook the keep is skipped and constrained clients are released like any other. The game's
+  hidden cursor would hide ours too, so the keep forces `left_ptr` through Hyprland's cursor
+  shape override (`CURSOR_OVERRIDE_SPECIAL_ACTION`). `restorePointerFocus` (and the dtor)
+  unset it. A kept pointer goes stale when another window is picked, so `activateWindow` calls
+  `releasePointerFocus` right after the focus change and `restorePointerFocus` hands a
+  non-focused holder over. `restorePointerFocus` keeps a re-enter-at-the-lock-hint fallback for
+  a constrained client that ended up without pointer focus anyway: `sendMotionEventsToFocused`
+  bails on `isConstrained()`, and the locked motion path only warps. Verified in the nested VM
+  with a lock client: no leave/enter across open/close, 0 relative motions while up, motion and
+  clicks after close, and a gloview flip away and back producing exactly a keybind switch's
+  event sequence.
 - **Clicking an EMPTY strip card goes there and closes** — `activateWorkspace` =
   `switchToWorkspace` (which creates the create-on-use tail's workspace) + `close()` (which
   commits it). Covers `dynamic_workspaces`' trailing `isNew` card and any listed workspace with
