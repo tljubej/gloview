@@ -39,6 +39,7 @@
 #include <hyprland/src/render/pass/SurfacePassElement.hpp>
 #include <hyprland/src/render/pass/RendererHintsPassElement.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
+#include <hyprland/src/protocols/PointerConstraints.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
 
@@ -2501,6 +2502,25 @@ void Overview::releasePointerFocus() const {
 void Overview::restorePointerFocus() const {
     if (!g_pInputManager || !g_pSeatManager || g_pSeatManager->m_state.pointerFocus)
         return; // never released (cursor sat on another monitor), or Hyprland re-routed already
+    // A pointer-LOCKED client — a game in mouselook: Xwayland locks the pointer for a Wine/Proton
+    // game's hidden cursor + ClipCursor — keeps its constraint ACTIVE through the overview, since
+    // Hyprland ties constraints to KEYBOARD focus and that never left it. Only its pointer focus was
+    // taken (releasePointerFocus), and Hyprland has no path that hands it back while it is
+    // constrained: sendMotionEventsToFocused() bails on isConstrained(), the locked motion path only
+    // warps the cursor to the lock hint, and a click doesn't refocus. Relative motion and buttons
+    // both go to the pointer focus, so the game was left mouse-dead until keyboard focus left and
+    // came back. Re-enter it at the lock hint, as CPointerConstraint::activate() does, and replay a
+    // motion so the cursor goes back to the hint (or into a confine region).
+    if (g_pInputManager->isConstrained()) {
+        const auto surf       = Desktop::View::CWLSurface::fromResource(Desktop::focusState()->surface());
+        const auto constraint = surf ? surf->constraint() : nullptr;
+        if (constraint) {
+            const auto box = surf->getSurfaceBoxGlobal();
+            g_pSeatManager->setPointerFocus(surf->resource(), box ? constraint->logicPositionHint() - box->pos() : Vector2D{});
+            g_pInputManager->simulateMouseMovement();
+        }
+        return;
+    }
     // Hyprland's motion path routes again from the next event, but until the cursor moves
     // nobody holds the pointer — a wheel tick, or a click on the very window just picked
     // (processMouseDownNormal only refocuses when the window under the cursor is NOT the
@@ -3382,6 +3402,15 @@ void Overview::syncFocus() const {
     if (!m || !w || !w->m_isMapped || w->isHidden())
         return;
     if (w->m_workspace != m->m_activeWorkspace) // displaying a non-live workspace — don't desync
+        return;
+    // Never pull focus under a fullscreen window from a mere hover. fullWindowFocus applies
+    // Hyprland's fullscreen policy: misc:on_focus_under_fullscreen (default 2) UNFULLSCREENS it,
+    // and a floating window is flagged allowed-over-fullscreen and stays raised over it after
+    // close. It also moves keyboard focus off the fullscreen client, which drops a game's pointer
+    // lock and tells a Wine/Proton game it was deactivated. A real pick (activateWindow) still goes
+    // through the policy, like clicking that window normally would.
+    const auto fs = Fullscreen::controller()->getFullscreenWindow(w->m_workspace);
+    if (fs && fs != w && !Fullscreen::controller()->layoutManagedFS(fs))
         return;
     Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_KEYBIND);
     // With follow_mouse=0 rawWindowFocus ends in sendMotionEventsToFocused(): a pointer enter
