@@ -435,6 +435,19 @@ toggle (read live). The load-bearing rules:
   `switch_on_new_workspace`. Displaying a blank desktop inside the overview was a dead end that
   users read as "the empty workspace doesn't open". Takes the `StripItem` by value:
   `switchToWorkspace` rebuilds `m_strip` under a reference.
+- **A click never changes REAL focus or the live workspace inside the button event
+  (`afterButtonEvent`).** Cancelling `input.mouse.button` hides nothing from other plugins:
+  every listener still runs. hyprbars hit-tests the real title bar under the overview, so a press
+  over the focused window's bar arms its drag. Its release handler disarms the drag only while
+  that window is still focused. The empty-card click used to commit its workspace on PRESS, so
+  nothing was focused at the release and hyprbars dragged the window on the next motion until the
+  next click (traced with a `dragBegin` hook: caller `CHyprBar::handleMovement`). So the empty card
+  acts on RELEASE (`PRESS_ACTIVATE` + `m_pressCard`), and `activateWorkspace` / `activateWindow` /
+  the empty-space `close()` run via `afterButtonEvent` on the next idle, once every listener has
+  seen the press/release pair under one focus state, whatever the plugin load order.
+  `open()` defers its `releasePointerFocus` the same way: a release-only mouse bind opens it from
+  inside that release, and since 0.57 such a bind no longer swallows its press, so dropping focus
+  first would lose the release the window under the cursor is owed.
 - **Closing a window** is async: `sendClose()` doesn't unmap immediately. `syncTiles()` runs
   each frame and, when a tile's weak window ptr goes null (or the window set changes),
   rebuilds + `replayReflow`s the survivors. `replayReflow` is the shared reflow tail (also

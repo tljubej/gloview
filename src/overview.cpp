@@ -980,7 +980,19 @@ void Overview::open() {
     // The window under the cursor holds the pointer right now; from here on it is hidden and
     // the pointer is ours (onMouseMove). Send it its leave, else it keeps hover state until
     // the first motion, and put the plain arrow up in place of whatever shape it had set.
-    releasePointerFocus();
+    // NOT synchronously: open() can run INSIDE a button event. A release-only mouse bind
+    // (`hl.bind("mouse:278", ..., {release = true})`) fires from Hyprland's handling of that very
+    // release, before the release is sent to the pointer focus, and since 0.57 such a bind no
+    // longer swallows its press — the window under the cursor got the press. Dropping its focus
+    // here sent the release to nobody, leaving that client with a button it believes is still
+    // held. On the next idle the in-flight release has been delivered.
+    if (g_pEventLoopManager)
+        m_releaseLater = g_pEventLoopManager->doLaterLock([this] {
+            if (m_active)
+                releasePointerFocus();
+        });
+    else
+        releasePointerFocus();
     damage();
 }
 
@@ -1051,7 +1063,10 @@ void Overview::close() {
 // deactivate it does NOT commit the displayed workspace — unload snaps back to the live one.
 void Overview::hardClose() {
     // Kill the recapture timer FIRST: its fire lambda captures `this` in this .so, so a
-    // tick still pending at unload is the IPC-dead-spin hazard.
+    // tick still pending at unload is the IPC-dead-spin hazard. Same for open()'s deferred
+    // pointer release and a deferred click action (dropping a lock unregisters it).
+    m_releaseLater.reset();
+    m_clickLater.reset();
     m_recaptureLeft = 0;
     if (m_recaptureTimer) {
         m_recaptureTimer->cancel();
@@ -2736,6 +2751,7 @@ constexpr int PRESS_NONE  = -1;
 constexpr int PRESS_STRIP = -2; // press landed on a strip card (switch happened)
 constexpr int PRESS_EMPTY = -3; // press landed on empty space (close on release)
 constexpr int PRESS_CONSUMED = -4; // press fully handled (e.g. desktop ✕) — release must do nothing
+constexpr int PRESS_ACTIVATE = -5; // press landed on an empty card (m_pressCard): go there on release
 // BTN_MIDDLE (0x112) comes from linux/input-event-codes.h, pulled in transitively.
 } // namespace
 
@@ -2786,16 +2802,18 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
         // strip card → switch the displayed workspace right away (no drag here); the
         // "+" card creates a new workspace (addWorkspace handles follow + pop-in anim). A card
         // with nothing on it to pick — dynamic_workspaces' trailing empty card, or a listed
-        // empty workspace — is a destination, not a view: go there and dismiss (activateWorkspace).
+        // empty workspace — is a destination, not a view: go there and dismiss (activateWorkspace),
+        // on RELEASE (see afterButtonEvent: it commits the live workspace, which moves real focus).
         for (size_t i = 0; i < m_strip.size(); ++i) {
             const LRect c = stripCardAt(i);
             if (lx >= c.x && ly >= c.y && lx <= c.x + c.w && ly <= c.y + c.h) {
                 m_pressTile = PRESS_STRIP;
                 if (m_strip[i].isAll)
                     toggleAllWorkspaces();
-                else if (m_strip[i].isNew || (!m_strip[i].isPlus && m_strip[i].wins.empty()))
-                    activateWorkspace(m_strip[i]);
-                else if (m_strip[i].isPlus)
+                else if (m_strip[i].isNew || (!m_strip[i].isPlus && m_strip[i].wins.empty())) {
+                    m_pressTile = PRESS_ACTIVATE;
+                    m_pressCard = m_strip[i];
+                } else if (m_strip[i].isPlus)
                     addWorkspace(m_strip[i].id); // the plain "+": create it (switch_on_new_workspace decides whether the display follows)
                 else
                     switchToWorkspace(m_strip[i]);
@@ -2832,6 +2850,11 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
 
     if (press == PRESS_STRIP || press == PRESS_CONSUMED)
         return true; // switch / ✕ already handled on press; ignore the release
+
+    if (press == PRESS_ACTIVATE) {
+        afterButtonEvent([this, card = m_pressCard] { activateWorkspace(card); });
+        return true;
+    }
 
     if (press >= 0 && press < static_cast<int>(m_tiles.size())) {
         const auto w = m_tiles[press].win.lock();
@@ -2874,13 +2897,32 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
             return true;
         }
         // a plain click → follow that window's workspace, focus it and dismiss
-        activateWindow(w, false);
+        afterButtonEvent([this, wref = PHLWINDOWREF(w)] { activateWindow(wref.lock(), false); });
         return true;
     }
 
     if (cfgInt("plugin:gloview:exit_on_click", 1) != 0)
-        close(); // released on empty space
+        afterButtonEvent([this] { close(); }); // released on empty space
     return true;
+}
+
+// Click actions that move Hyprland's REAL focus or live workspace (activateWorkspace,
+// activateWindow, close — all commit the displayed workspace) must not run inside the button
+// event. Cancelling it doesn't hide it from other plugins' listeners, and hyprbars hit-tests the
+// REAL title bar under the overview: a press over the focused window's bar arms its drag, and its
+// release handler only disarms it while that window is still focused. Committing an empty card on
+// press focused nothing, so the release bailed and hyprbars dragged the window on the next motion
+// until the next click. Run after the event instead, so every listener sees one focus state for
+// the whole press/release pair, whatever order the plugins were loaded in.
+void Overview::afterButtonEvent(std::function<void()> fn) {
+    if (!g_pEventLoopManager) {
+        fn();
+        return;
+    }
+    m_clickLater = g_pEventLoopManager->doLaterLock([this, fn = std::move(fn)] {
+        if (m_active)
+            fn();
+    });
 }
 
 void Overview::dropOnWorkspace(const PHLWINDOW& w, const StripItem& it, const LRect& fromBox) {

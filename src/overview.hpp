@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -29,6 +30,7 @@ class IFramebuffer;
 
 class CFunctionHook;
 class CEventLoopTimer;
+struct SEventLoopDoLaterLock;
 
 namespace gloview {
 
@@ -253,10 +255,13 @@ class Overview {
     double                                m_stripScroll = 0.0;    // strip group scroll offset along its main axis
     double                                m_stripScrollMax = 0.0; // max scroll (0 when the cards fit the band)
     SP<CEventLoopTimer>                   m_recaptureTimer;    // off-render-loop re-snapshot after a drop (makeSnapshot mid-render crashes)
+    UP<SEventLoopDoLaterLock>             m_releaseLater;      // open()'s pointer-focus drop, deferred past the input event that opened it
+    UP<SEventLoopDoLaterLock>             m_clickLater;        // a click's focus-changing action, run once the button event is fully dispatched
     int                                   m_recaptureLeft = 0; // remaining recapture ticks while windows repaint at their new size
 
     // drag-and-drop of a window preview onto a workspace card
     int    m_pressTile = -1;          // tile under the press (drag candidate)
+    StripItem m_pressCard;            // the empty card under the press (PRESS_ACTIVATE), activated on release
     bool   m_dragging  = false;       // moved past the threshold
     double m_pressX = 0, m_pressY = 0;// monitor-local press point
     double m_grabDX = 0, m_grabDY = 0;// cursor offset inside the tile at grab
@@ -338,6 +343,7 @@ class Overview {
     LRect  stripCardBox(size_t i, const Vector2D& slide, const Vector2D& scroll) const; // card box incl. scroll + pop-in
     void   switchToWorkspace(const StripItem& it);
     void   activateWorkspace(StripItem it);   // click on an EMPTY card (create-on-use tail, or a listed empty workspace): display it, then close onto it
+    void   afterButtonEvent(std::function<void()> fn); // run a click's focus/workspace change after every button listener saw the event
     void   commitWorkspace();                 // push the displayed workspace to the live desktop, warping Hyprland's own slide away
     void   dropOnWorkspace(const PHLWINDOW& w, const StripItem& it, const LRect& fromBox);
     void   swapTiles(int a, int b);           // drag a preview onto another → swap the two windows' places (real layout + overview)
