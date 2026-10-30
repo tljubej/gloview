@@ -96,7 +96,7 @@ Four translation units, layered by Hyprland coupling:
   the dispatchers, the `hyprctl` commands, and (Lua config only) the `gloview.*` Lua
   functions. Owns the `g_overview` singleton. Every user-facing entry point exists here in
   **three parallel registrations** — `addDispatcherV2`, `registerHyprCtlCommand`
-  (`.exact = true`), `addLuaFunction` — and a new one should add all three.
+  (`.match = COMMAND_MATCH_EXACT`), `addLuaFunction` — and a new one should add all three.
 - **`src/overview.{cpp,hpp}`** (~3450 lines) — the `Overview` class. All Hyprland-coupled
   logic: rendering, input, snapshot capture, animation, drag-and-drop, workspace ops.
   `overview.hpp` is the map of it, and its comments carry most of the hard-won reasoning.
@@ -138,6 +138,13 @@ draw *before* the strip so tiles flying in from real positions (possibly under t
 beneath it; the dragged tile draws *last* so it floats over the bar onto a card. The overview
 damages the monitor every frame while up (continuous repaint clears transient blur/snapshot/hover
 residue).
+
+Since Hyprland 0.57 there is no global render state: the `render.stage` event carries the frame's
+`Render::CRenderContext` (`ev.context`, empty for PRE/POST), and every draw call
+(`renderRect`/`renderTexture`/`renderBorder`/`scissor`/`projectBoxToTarget`) and every queued
+element (`IHyprRenderer::addPassElement(ctx, …)`) takes it. `renderStage` pulls it off the event,
+the surface-queuing helpers take it as their first argument, and the `COverlayPass` phases get it
+from `draw(ctx)` and pass it down to the chrome.`
 
 **Rings (hover / keyboard-select / active card) are drawn ON TOP of the live surfaces, as HOLLOW
 borders** (`renderRing` → Hyprland's `renderBorder`), *inside* the tile/card box, so the band
@@ -195,7 +202,7 @@ doesn't accommodate, or a window mid-resize) at its real size — a *big* uncove
 1px seam. `renderWindowLive` sets **`m_fillIgnoreSmall = true`** so the buffer stretches to fill
 instead. Hyprland never sets this flag itself, so **`restoreFill()`** blanket-resets it to
 `false` on teardown (`deactivate`/`hardClose`/dtor, same triple-guard as `restoreLayers`). NOTE:
-this path was NOT reproducible with Wayland clients (their `getReportedSize` returns the *acked*
+this path was NOT reproducible with Wayland clients (their `backend().reportedSize()` returns the *acked*
 size, so reported==buffer); it is kept as a guard for X11/edge cases, not the observed bug.
 
 The strip is anchored to any edge via `plugin:gloview:anchor`
@@ -251,6 +258,13 @@ in `captureSnapshots()`; read its comments before touching it:
 
 ### Workspaces: displayed vs live
 
+**Workspace ids (0.57+).** A workspace is either numbered or not (named workspaces and
+scratchpads, which used to carry negative ids), and persistence lives only on
+`Workspace::CRegularWorkspace`. The anon-ns helpers in overview.cpp hide that: `wsNum()` (0 = not
+numbered — what the old `m_id <= 0` checks meant), `wsSpecial()`, `findNumberedWs()`,
+`createNumberedWs()` (which also calls `ready()`; `create` no longer announces the workspace) and
+`setWsPersistent()`/`wsPersistent()`. The strip lists and creates numbered workspaces only.
+
 The overview shows `m_workspace` (the *displayed* workspace); the monitor's real active
 workspace only changes on `commitWorkspace()` at close (which also warps Hyprland's own
 slide away). Consequences:
@@ -292,7 +306,7 @@ slide away). Consequences:
   tile — the *other* workspace's window — popped over the active one for the whole open glide
   and expanded over the picked one on close, until the real window appeared at deactivate.
 - **`addWorkspace()`** (the `+`/empty card): a brand-new empty workspace is reaped within a
-  frame or two unless focused, so it is held `setPersistent(true)` (tracked in `m_newWs`) for
+  frame or two unless focused, so it is held persistent via `setWsPersistent(ws, true)` (tracked in `m_newWs`) for
   the overview's lifetime and released on `deactivate()`/`close()`/dtor.
   `switch_on_new_workspace` decides whether to follow the display to it. Only the plain `+` card
   reaches it now: a click on the dynamic trailing card is `activateWorkspace` (below).
